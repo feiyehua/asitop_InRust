@@ -2,7 +2,7 @@ use libc::{
     self, HOST_VM_INFO64, HOST_VM_INFO64_COUNT, KERN_SUCCESS, c_int, c_void, host_statistics64,
     integer_t, mach_msg_type_number_t, mach_port_t, vm_statistics64,
 };
-use std::{mem, ptr, time::{Duration, Instant}};
+use std::{mem::{self, MaybeUninit}, ptr, time::{Duration, Instant}};
 
 const SWAP_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -44,13 +44,13 @@ impl MemoryReader {
     }
 
     pub fn read(&mut self) -> MemoryStats {
-        let mut stats: vm_statistics64 = unsafe { mem::zeroed() };
+        let mut stats = MaybeUninit::<vm_statistics64>::uninit();
         let mut count: mach_msg_type_number_t = HOST_VM_INFO64_COUNT;
         let result = unsafe {
             host_statistics64(
                 self.host_port,
                 HOST_VM_INFO64,
-                &mut stats as *mut vm_statistics64 as *mut integer_t,
+                stats.as_mut_ptr() as *mut integer_t,
                 &mut count,
             )
         };
@@ -60,6 +60,9 @@ impl MemoryReader {
                 ..MemoryStats::default()
             };
         }
+
+        // SAFETY: host_statistics64 succeeded, so stats is fully initialized
+        let stats = unsafe { stats.assume_init() };
 
         if self.total_bytes == 0 {
             self.total_bytes = read_total_memory().unwrap_or(0);
@@ -123,20 +126,22 @@ impl Drop for MemoryReader {
 }
 
 fn read_swap_usage() -> (u64, u64) {
-    let mut swap: libc::xsw_usage = unsafe { mem::zeroed() };
+    let mut swap = MaybeUninit::<libc::xsw_usage>::uninit();
     let mut mib = [libc::CTL_VM, libc::VM_SWAPUSAGE];
     let mut len = mem::size_of::<libc::xsw_usage>();
     let result = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
             mib.len() as libc::c_uint,
-            &mut swap as *mut _ as *mut c_void,
+            swap.as_mut_ptr() as *mut c_void,
             &mut len,
             ptr::null_mut(),
             0,
         )
     };
     if result == 0 {
+        // SAFETY: sysctl succeeded, so swap is fully initialized
+        let swap = unsafe { swap.assume_init() };
         (swap.xsu_total, swap.xsu_used)
     } else {
         (0, 0)
