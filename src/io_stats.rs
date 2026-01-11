@@ -8,7 +8,11 @@ use libc::{
     self, AF_LINK, IFF_LOOPBACK, IFF_UP, KERN_SUCCESS, c_char, c_void, freeifaddrs, getifaddrs,
     if_data, ifaddrs, mach_port_t,
 };
-use std::{ffi::CString, ptr, time::{Duration, Instant}};
+use std::{
+    ffi::CString,
+    ptr,
+    time::{Duration, Instant},
+};
 
 const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -93,119 +97,250 @@ fn rate_from_delta(current: u64, previous: u64, delta_secs: f64) -> f32 {
     }
 }
 
+/// RAII wrapper for interface addresses list
+struct IfAddrs {
+    ptr: *mut ifaddrs,
+}
+
+impl IfAddrs {
+    fn new() -> Option<Self> {
+        let mut ptr = ptr::null_mut();
+        // SAFETY: getifaddrs is called with a valid pointer to store the result
+        let result = unsafe { getifaddrs(&mut ptr) };
+        if result != 0 || ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr })
+        }
+    }
+
+    fn iter(&self) -> IfAddrsIter {
+        IfAddrsIter {
+            current: self.ptr,
+            remaining: 1000, // MAX_INTERFACES
+        }
+    }
+}
+
+impl Drop for IfAddrs {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr is guaranteed to be valid and non-null from successful getifaddrs
+            unsafe { freeifaddrs(self.ptr) };
+        }
+    }
+}
+
+struct IfAddrsIter {
+    current: *const ifaddrs,
+    remaining: usize,
+}
+
+impl Iterator for IfAddrsIter {
+    type Item = IfAddrRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() || self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+
+        // SAFETY: current is checked to be non-null and comes from valid getifaddrs result
+        let iface = unsafe { &*self.current };
+        self.current = iface.ifa_next;
+
+        Some(IfAddrRef { inner: iface })
+    }
+}
+
+struct IfAddrRef {
+    inner: &'static ifaddrs,
+}
+
+impl IfAddrRef {
+    fn is_valid_link_interface(&self) -> bool {
+        if self.inner.ifa_addr.is_null() {
+            return false;
+        }
+
+        // SAFETY: ifa_addr is checked to be non-null
+        let sa_family = unsafe { (*self.inner.ifa_addr).sa_family as i32 };
+        if sa_family != AF_LINK {
+            return false;
+        }
+
+        let flags = self.inner.ifa_flags as i32;
+        (flags & IFF_UP) != 0 && (flags & IFF_LOOPBACK) == 0
+    }
+
+    fn get_traffic_stats(&self) -> Option<(u64, u64)> {
+        let data_ptr = self.inner.ifa_data as *const if_data;
+        if data_ptr.is_null() {
+            return None;
+        }
+
+        // SAFETY: data_ptr is checked to be non-null and comes from valid ifaddrs
+        unsafe {
+            data_ptr
+                .as_ref()
+                .map(|data| (data.ifi_ibytes as u64, data.ifi_obytes as u64))
+        }
+    }
+}
+
 fn read_network_counters() -> Option<(u64, u64)> {
-    // SAFETY: We use getifaddrs/freeifaddrs correctly:
-    // 1. ifap is initialized to null before getifaddrs
-    // 2. We check both return value and null pointer
-    // 3. We always call freeifaddrs before returning
-    // 4. All pointer dereferences are guarded by null checks
-    unsafe {
-        let mut ifap: *mut ifaddrs = ptr::null_mut();
-        if getifaddrs(&mut ifap) != 0 {
-            return None;
-        }
-        if ifap.is_null() {
-            return None;
-        }
-        
-        let mut total_in = 0u64;
-        let mut total_out = 0u64;
-        let mut cursor = ifap;
-        
-        // Limit iterations to prevent infinite loops from corrupted data
-        const MAX_INTERFACES: usize = 1000;
-        let mut iterations = 0;
-        
-        while !cursor.is_null() && iterations < MAX_INTERFACES {
-            iterations += 1;
-            let iface = &*cursor;
-            
-            // Validate ifa_addr before dereferencing
-            if !iface.ifa_addr.is_null() {
-                let sa_family = (*iface.ifa_addr).sa_family as i32;
-                if sa_family == AF_LINK {
-                    let flags = iface.ifa_flags as i32;
-                    if (flags & IFF_UP) != 0 && (flags & IFF_LOOPBACK) == 0 {
-                        // Validate ifa_data pointer before use
-                        let data_ptr = iface.ifa_data as *const if_data;
-                        if !data_ptr.is_null() {
-                            // Use as_ref for safe optional dereference
-                            if let Some(data) = data_ptr.as_ref() {
-                                total_in = total_in.saturating_add(data.ifi_ibytes as u64);
-                                total_out = total_out.saturating_add(data.ifi_obytes as u64);
-                            }
-                        }
-                    }
-                }
+    let ifaddrs = IfAddrs::new()?;
+
+    let mut total_in = 0u64;
+    let mut total_out = 0u64;
+
+    for iface in ifaddrs.iter() {
+        if iface.is_valid_link_interface() {
+            if let Some((rx, tx)) = iface.get_traffic_stats() {
+                total_in = total_in.saturating_add(rx);
+                total_out = total_out.saturating_add(tx);
             }
-            cursor = iface.ifa_next;
         }
-        
-        freeifaddrs(ifap);
-        Some((total_in, total_out))
+    }
+
+    Some((total_in, total_out))
+}
+
+/// Safe wrapper for IOKit iterator
+struct IOIterator {
+    handle: io_iterator_t,
+}
+
+impl IOIterator {
+    fn for_block_storage() -> Option<Self> {
+        // SAFETY: IOServiceMatching is called with a valid C string
+        let matching =
+            unsafe { IOServiceMatching(b"IOBlockStorageDriver\0".as_ptr() as *const c_char) };
+        if matching.is_null() {
+            return None;
+        }
+
+        let mut handle: io_iterator_t = 0;
+        // SAFETY: IOServiceGetMatchingServices is called with valid parameters
+        let result = unsafe { IOServiceGetMatchingServices(0, matching, &mut handle) };
+
+        if result != KERN_SUCCESS {
+            if handle != 0 {
+                // SAFETY: handle is valid from IOServiceGetMatchingServices
+                unsafe { IOObjectRelease(handle) };
+            }
+            return None;
+        }
+
+        Some(Self { handle })
+    }
+}
+
+impl Iterator for IOIterator {
+    type Item = IOObject;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: handle is guaranteed to be valid from constructor
+        let entry = unsafe { IOIteratorNext(self.handle) };
+        if entry == 0 {
+            None
+        } else {
+            Some(IOObject { handle: entry })
+        }
+    }
+}
+
+impl Drop for IOIterator {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            // SAFETY: handle is guaranteed to be valid from constructor
+            unsafe { IOObjectRelease(self.handle) };
+        }
+    }
+}
+
+/// Safe wrapper for IOKit object
+struct IOObject {
+    handle: io_object_t,
+}
+
+impl Drop for IOObject {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            // SAFETY: handle is guaranteed to be valid from IOIteratorNext
+            unsafe { IOObjectRelease(self.handle) };
+        }
     }
 }
 
 fn read_disk_counters() -> Option<(u64, u64)> {
-    unsafe {
-        let matching = IOServiceMatching(b"IOBlockStorageDriver\0".as_ptr() as *const c_char);
-        if matching.is_null() {
-            return None;
+    let iterator = IOIterator::for_block_storage()?;
+
+    let mut total_read = 0u64;
+    let mut total_write = 0u64;
+
+    for entry in iterator {
+        if let Some((read, write)) = read_entry_bytes(entry.handle) {
+            total_read = total_read.saturating_add(read);
+            total_write = total_write.saturating_add(write);
         }
-        let mut iterator: io_iterator_t = 0;
-        let result = IOServiceGetMatchingServices(0, matching, &mut iterator);
-        if result != KERN_SUCCESS {
-            if iterator != 0 {
-                IOObjectRelease(iterator);
-            }
-            return None;
+    }
+
+    Some((total_read, total_write))
+}
+
+/// Safe wrapper for CoreFoundation types
+struct CFRef {
+    ptr: CFTypeRef,
+}
+
+impl CFRef {
+    fn from_registry_entry(entry: io_registry_entry_t) -> Option<Self> {
+        let mut properties: CFMutableDictionaryRef = ptr::null_mut();
+        // SAFETY: IORegistryEntryCreateCFProperties is called with valid parameters
+        let result =
+            unsafe { IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0) };
+
+        if result != KERN_SUCCESS || properties.is_null() {
+            None
+        } else {
+            Some(Self {
+                ptr: properties as CFTypeRef,
+            })
         }
-        let mut total_read = 0u64;
-        let mut total_write = 0u64;
-        loop {
-            let entry = IOIteratorNext(iterator);
-            if entry == 0 {
-                break;
-            }
-            if let Some((read, write)) = read_entry_bytes(entry) {
-                total_read = total_read.saturating_add(read);
-                total_write = total_write.saturating_add(write);
-            }
-            IOObjectRelease(entry);
+    }
+
+    fn as_dict(&self) -> CFDictionaryRef {
+        self.ptr as CFDictionaryRef
+    }
+}
+
+impl Drop for CFRef {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr is guaranteed to be valid from constructor
+            unsafe { CFRelease(self.ptr) };
         }
-        if iterator != 0 {
-            IOObjectRelease(iterator);
-        }
-        Some((total_read, total_write))
     }
 }
 
 fn read_entry_bytes(entry: io_registry_entry_t) -> Option<(u64, u64)> {
-    unsafe {
-        let mut properties: CFMutableDictionaryRef = ptr::null_mut();
-        let result = IORegistryEntryCreateCFProperties(entry, &mut properties, ptr::null(), 0);
-        if result != KERN_SUCCESS || properties.is_null() {
-            return None;
-        }
-        let parsed = (|| {
-            let stats_dict = get_dict_value(properties as CFDictionaryRef, "Statistics")?;
-            let bytes_read = get_number(stats_dict, "Bytes (Read)")?;
-            let bytes_write = get_number(stats_dict, "Bytes (Write)")?;
-            Some((bytes_read, bytes_write))
-        })();
-        CFRelease(properties as CFTypeRef);
-        parsed
-    }
+    let properties = CFRef::from_registry_entry(entry)?;
+
+    let stats_dict = get_dict_value(properties.as_dict(), "Statistics")?;
+    let bytes_read = get_number(stats_dict, "Bytes (Read)")?;
+    let bytes_write = get_number(stats_dict, "Bytes (Write)")?;
+
+    Some((bytes_read, bytes_write))
 }
 
 fn get_dict_value(dict: CFDictionaryRef, key: &str) -> Option<CFDictionaryRef> {
-    let cf_key = cf_string(key)?;
+    let cf_key = CFString::new(key)?;
     let mut value: *const c_void = ptr::null();
-    let success =
-        unsafe { CFDictionaryGetValueIfPresent(dict, cf_key as *const c_void, &mut value) };
-    unsafe {
-        CFRelease(cf_key as CFTypeRef);
-    }
+
+    // SAFETY: CFDictionaryGetValueIfPresent is called with valid dictionary and key
+    let success = unsafe { CFDictionaryGetValueIfPresent(dict, cf_key.as_ptr(), &mut value) };
+
     if success == 0 || value.is_null() {
         None
     } else {
@@ -214,17 +349,18 @@ fn get_dict_value(dict: CFDictionaryRef, key: &str) -> Option<CFDictionaryRef> {
 }
 
 fn get_number(dict: CFDictionaryRef, key: &str) -> Option<u64> {
-    let cf_key = cf_string(key)?;
+    let cf_key = CFString::new(key)?;
     let mut value: *const c_void = ptr::null();
-    let success =
-        unsafe { CFDictionaryGetValueIfPresent(dict, cf_key as *const c_void, &mut value) };
-    unsafe {
-        CFRelease(cf_key as CFTypeRef);
-    }
+
+    // SAFETY: CFDictionaryGetValueIfPresent is called with valid dictionary and key
+    let success = unsafe { CFDictionaryGetValueIfPresent(dict, cf_key.as_ptr(), &mut value) };
+
     if success == 0 || value.is_null() {
         return None;
     }
+
     let mut raw: i64 = 0;
+    // SAFETY: CFNumberGetValue is called with valid number reference and buffer
     let ok = unsafe {
         CFNumberGetValue(
             value as CFNumberRef,
@@ -232,22 +368,50 @@ fn get_number(dict: CFDictionaryRef, key: &str) -> Option<u64> {
             &mut raw as *mut _ as *mut c_void,
         )
     };
+
     if ok == 0 {
-        return None;
+        None
+    } else {
+        Some(raw.max(0) as u64)
     }
-    Some(raw.max(0) as u64)
 }
 
-fn cf_string(value: &str) -> Option<CFStringRef> {
-    let cstring = CString::new(value).ok()?;
-    let cf = unsafe {
-        CFStringCreateWithCString(
-            ptr::null(),
-            cstring.as_ptr(),
-            kCFStringEncodingUTF8 as CFStringEncoding,
-        )
-    };
-    if cf.is_null() { None } else { Some(cf) }
+/// Safe wrapper for CFString
+struct CFString {
+    ptr: CFStringRef,
+}
+
+impl CFString {
+    fn new(value: &str) -> Option<Self> {
+        let cstring = CString::new(value).ok()?;
+        // SAFETY: CFStringCreateWithCString is called with valid C string and encoding
+        let ptr = unsafe {
+            CFStringCreateWithCString(
+                ptr::null(),
+                cstring.as_ptr(),
+                kCFStringEncodingUTF8 as CFStringEncoding,
+            )
+        };
+
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr })
+        }
+    }
+
+    fn as_ptr(&self) -> *const c_void {
+        self.ptr as *const c_void
+    }
+}
+
+impl Drop for CFString {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr is guaranteed to be valid from constructor
+            unsafe { CFRelease(self.ptr as CFTypeRef) };
+        }
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -259,15 +423,15 @@ type io_registry_entry_t = io_object_t;
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
-    fn IOServiceGetMatchingServices(
+    unsafe fn IOServiceMatching(name: *const c_char) -> CFMutableDictionaryRef;
+    unsafe fn IOServiceGetMatchingServices(
         master_port: mach_port_t,
         matching: CFMutableDictionaryRef,
         existing: *mut io_iterator_t,
     ) -> libc::kern_return_t;
-    fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
-    fn IOObjectRelease(object: io_object_t) -> libc::kern_return_t;
-    fn IORegistryEntryCreateCFProperties(
+    unsafe fn IOIteratorNext(iterator: io_iterator_t) -> io_object_t;
+    unsafe fn IOObjectRelease(object: io_object_t) -> libc::kern_return_t;
+    unsafe fn IORegistryEntryCreateCFProperties(
         entry: io_registry_entry_t,
         properties: *mut CFMutableDictionaryRef,
         allocator: CFAllocatorRef,
@@ -277,17 +441,17 @@ unsafe extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    fn CFStringCreateWithCString(
+    unsafe fn CFStringCreateWithCString(
         alloc: CFAllocatorRef,
         c_str: *const c_char,
         encoding: CFStringEncoding,
     ) -> CFStringRef;
-    fn CFDictionaryGetValueIfPresent(
+    unsafe fn CFDictionaryGetValueIfPresent(
         dict: CFDictionaryRef,
         key: *const c_void,
         value: *mut *const c_void,
     ) -> Boolean;
-    fn CFNumberGetValue(
+    unsafe fn CFNumberGetValue(
         number: CFNumberRef,
         the_type: CFNumberType,
         value_ptr: *mut c_void,

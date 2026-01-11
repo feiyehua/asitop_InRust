@@ -45,17 +45,16 @@ impl From<u32> for ThermalLevel {
 
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
-    fn IOPMGetThermalWarningLevel(level: *mut u32) -> i32;
+    unsafe fn IOPMGetThermalWarningLevel(level: *mut u32) -> i32;
 }
 
 pub fn read_warning_level() -> Option<ThermalLevel> {
-    unsafe {
+
         let mut level = 0u32;
-        let status = IOPMGetThermalWarningLevel(&mut level as *mut u32);
+        let status = unsafe { IOPMGetThermalWarningLevel(&mut level as *mut u32) };
         if status == 0 {
             Some(ThermalLevel::from(level))
         } else {
             None
         }
-    }
 }
