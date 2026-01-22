@@ -74,6 +74,8 @@ struct RawCluster {
     freq_hz: f64,
     idle_ratio: f64,
     #[serde(default)]
+    down_ratio: f64,
+    #[serde(default)]
     cpus: Vec<RawCore>,
 }
 
@@ -89,6 +91,8 @@ struct RawCore {
     cpu: u32,
     freq_hz: f64,
     idle_ratio: f64,
+    #[serde(default)]
+    down_ratio: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,10 +228,11 @@ fn convert_snapshot(raw: RawSnapshot) -> PowermetricsReading {
             name,
             freq_hz,
             idle_ratio,
+            down_ratio,
             cpus,
         } = cluster;
         let freq_mhz = display_freq(freq_hz);
-        let active = ratio_to_pct(idle_ratio);
+        let active = ratio_to_pct(idle_ratio + down_ratio);
         let is_e = name.starts_with(['E', 'e']);
         if is_e {
             e_clusters.push(ClusterData {
@@ -245,7 +250,7 @@ fn convert_snapshot(raw: RawSnapshot) -> PowermetricsReading {
         for core in cpus {
             let metrics = CoreMetrics {
                 id: core.cpu,
-                active_pct: ratio_to_pct(core.idle_ratio),
+                active_pct: ratio_to_pct(core.idle_ratio + core.down_ratio),
                 freq_mhz: display_freq(core.freq_hz),
             };
             if is_e {
@@ -295,7 +300,8 @@ fn ratio_to_pct(idle_ratio: f64) -> u64 {
     if !idle_ratio.is_finite() {
         return 0;
     }
-    let ratio = if idle_ratio > 1.0 {
+    // Buggy as ratio > 1.0 may be true (due to floating point representation)
+    let ratio = if idle_ratio > 1.0001 {
         idle_ratio / 100.0
     } else {
         idle_ratio
