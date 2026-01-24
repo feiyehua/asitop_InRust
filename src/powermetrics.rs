@@ -31,7 +31,6 @@ pub struct CpuMetrics {
     pub cpu_w: f32,
     pub gpu_w: f32,
     pub ane_w: f32,
-    pub package_w: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,8 +63,6 @@ struct RawProcessor {
     cpu_energy: f64,
     #[serde(default)]
     gpu_energy: f64,
-    #[serde(default)]
-    combined_power: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,7 +269,6 @@ fn convert_snapshot(raw: RawSnapshot) -> PowermetricsReading {
             cpu_w: (raw.processor.cpu_energy / 1000.0) as f32,
             gpu_w: (raw.processor.gpu_energy / 1000.0) as f32,
             ane_w: (raw.processor.ane_energy / 1000.0) as f32,
-            package_w: (raw.processor.combined_power / 1000.0) as f32,
         },
         gpu: GpuMetrics {
             active_pct: ratio_to_pct(raw.gpu.idle_ratio),

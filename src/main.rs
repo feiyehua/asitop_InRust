@@ -332,7 +332,7 @@ impl AppState {
         let interval = std::cmp::max(self.config.interval, 1) as f32;
         self.cpu_power = self.cpu_metrics.cpu_w / interval;
         self.gpu_power = self.cpu_metrics.gpu_w / interval;
-        self.package_power = self.cpu_metrics.package_w / interval;
+        self.package_power = (self.cpu_metrics.cpu_w + self.cpu_metrics.gpu_w + self.cpu_metrics.ane_w) / interval;
         self.ane_power = self.cpu_metrics.ane_w / interval;
         let ane_max = self.soc.ane_max_power.max(1.0);
         self.ane_percent = ((self.ane_power / ane_max) * 100.0).clamp(0.0, 100.0).round() as u64;
@@ -343,7 +343,8 @@ impl AppState {
         self.cpu_avg.push(self.cpu_power);
         self.gpu_avg.push(self.gpu_power);
         self.package_avg.push(self.package_power);
-        self.power_history.push(self.cpu_power + self.gpu_power);
+        self.power_history
+            .push(self.cpu_power + self.gpu_power + self.ane_power);
     }
 
     fn snapshot(&self) -> UiSnapshot<'_> {
