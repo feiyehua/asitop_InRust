@@ -102,9 +102,8 @@ pub fn powermetrics_path(timecode: &str) -> String {
     format!("{POWER_FILE_PREFIX}{timecode}")
 }
 
-pub fn run_powermetrics(timecode: &str, interval_ms: u64) -> Result<Child> {
+pub fn run_powermetrics(_timecode: &str, interval_ms: u64) -> Result<Child> {
     cleanup_powermetrics_files().ok();
-    let path = powermetrics_path(timecode);
     let interval_arg = interval_ms.to_string();
     let mut cmd = Command::new("sudo");
     cmd.args([
@@ -114,15 +113,13 @@ pub fn run_powermetrics(timecode: &str, interval_ms: u64) -> Result<Child> {
         "powermetrics",
         "--samplers",
         "cpu_power,gpu_power,thermal",
-        "-o",
-        &path,
         "-f",
         "plist",
         "-i",
         &interval_arg,
     ])
     .stdin(Stdio::null())
-    .stdout(Stdio::null())
+    .stdout(Stdio::piped())
     .stderr(Stdio::null());
 
     cmd.spawn().with_context(|| "failed to spawn powermetrics")
@@ -150,62 +147,88 @@ pub fn new_timecode() -> String {
     now.to_string()
 }
 
-/// Cached reader for powermetrics file to reduce unnecessary I/O
+/// Cached reader for powermetrics stream to reduce unnecessary I/O
 pub struct PowermetricsReader {
-    path: String,
+    reader: Box<dyn Read + Send>,
+    path: Option<String>,
     last_len: u64,
     buffer: Vec<u8>,
 }
 
 impl PowermetricsReader {
-    pub fn new(timecode: &str) -> Self {
+    // /// Create a new reader from a child process's stdout
+    // pub fn from_child(mut child: Child) -> Self {
+    //     let stdout = child.stdout.take().expect("failed to get stdout from powermetrics");
+    //     Self {
+    //         reader: Some(Box::new(stdout) as Box<dyn Read + Send>),
+    //         path: None,
+    //         last_len: 0,
+    //         buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
+    //     }
+    // }
+
+    /// Create a new reader from a stdout stream
+    pub fn from_stdout(stdout: std::process::ChildStdout) -> Self {
         Self {
-            path: powermetrics_path(timecode),
+            reader: Box::new(stdout) as Box<dyn Read + Send>,
+            path: None,
             last_len: 0,
             buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
         }
     }
 
-    pub fn set_timecode(&mut self, timecode: &str) {
-        self.path = powermetrics_path(timecode);
-        self.last_len = 0;
-    }
+    // /// Create a new reader from a file (legacy mode)
+    // pub fn from_file(timecode: &str) -> Self {
+    //     Self {
+    //         reader: None,
+    //         path: Some(powermetrics_path(timecode)),
+    //         last_len: 0,
+    //         buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
+    //     }
+    // }
+
+    // /// Switch to reading from a new file (for restart)
+    // pub fn set_timecode(&mut self, timecode: &str) {
+    //     self.path = Some(powermetrics_path(timecode));
+    //     self.last_len = 0;
+    //     self.reader = None;
+    // }
 
     pub fn parse(&mut self) -> Result<Option<PowermetricsReading>> {
-        let mut file = match File::open(&self.path) {
-            Ok(f) => f,
+        // Stream-based reading (pipe mode)
+        let reader = self.reader.as_mut();
+
+        // Read new data into buffer
+        let mut temp_buf = [0u8; 8192];
+        let bytes_read = match reader.read(&mut temp_buf) {
+            Ok(n) => n,
             Err(_) => return Ok(None),
         };
 
-        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if len == 0 {
+        if bytes_read == 0 {
             return Ok(None);
         }
 
-        // Skip if file size hasn't changed
-        if len == self.last_len {
-            return Ok(None);
-        }
-        self.last_len = len;
-
-        let start = len.saturating_sub(MAX_READ_BYTES);
-        if file.seek(SeekFrom::Start(start)).is_err() {
-            file.seek(SeekFrom::Start(0)).ok();
-        }
-
-        self.buffer.clear();
-        if let Err(e) = file.read_to_end(&mut self.buffer) {
-            if self.buffer.is_empty() {
-                return Err(anyhow::anyhow!("failed to read powermetrics chunk: {}", e));
-            }
-        }
+        self.buffer.extend_from_slice(&temp_buf[..bytes_read]);
 
         if self.buffer.is_empty() {
             return Ok(None);
         }
 
-        for chunk in self.buffer.split(|b| *b == 0).rev().filter(|c| !c.is_empty()) {
+        // Parse from the stream, looking for complete plist records
+        // We split by null bytes and try to parse each chunk
+        for chunk in self
+            .buffer
+            .split(|b| *b == 0)
+            .rev()
+            .filter(|c| !c.is_empty())
+        {
             if let Ok(snapshot) = plist::from_reader::<_, RawSnapshot>(Cursor::new(chunk)) {
+                // Keep only the latest complete record in buffer
+                // Find the position of this chunk in the buffer
+                if let Some(pos) = self.buffer.windows(chunk.len()).position(|w| w == chunk) {
+                    self.buffer = self.buffer[pos..].to_vec();
+                }
                 return Ok(Some(convert_snapshot(snapshot)));
             }
         }

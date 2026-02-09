@@ -44,18 +44,6 @@ impl PowermetricsGuard {
         Self { child: Some(child) }
     }
 
-    /// Kill and restart the process with a new timecode
-    fn restart(&mut self, timecode: &str, interval_ms: u64) -> Result<()> {
-        // Kill existing process first
-        if let Some(ref mut child) = self.child {
-            child.kill().ok();
-            child.wait().ok();
-        }
-        // Start new process
-        self.child = Some(run_powermetrics(timecode, interval_ms)?);
-        Ok(())
-    }
-
     /// Explicitly stop the child process
     fn stop(&mut self) {
         if let Some(ref mut child) = self.child {
@@ -91,11 +79,14 @@ fn main() -> Result<()> {
 
     println!("[2/3] Starting powermetrics process\n");
     let mut timecode = new_timecode();
-    let child =
+    let mut child =
         run_powermetrics(&timecode, cli.interval * 1000).context("failed to spawn powermetrics")?;
+    // Extract stdout to create reader
+    let child_stdout = child.stdout.take().expect("failed to get stdout");
     // Wrap child in RAII guard to ensure cleanup on panic or early return
     let mut guard = PowermetricsGuard::new(child);
-    let mut pm_reader = PowermetricsReader::new(&timecode);
+    // Create reader from child's stdout stream
+    let mut pm_reader = PowermetricsReader::from_stdout(child_stdout);
     println!("[3/3] Waiting for first reading...\n");
 
     let first_reading = wait_for_reading(&mut pm_reader, Duration::from_millis(100))
@@ -193,13 +184,24 @@ fn run_ui(
             }
         }
 
-        if state.config.max_count > 0 && state.samples_taken >= state.config.max_count {
-            *timecode = new_timecode();
-            guard.restart(timecode, state.config.interval * 1000)?;
-            pm_reader.set_timecode(timecode);
-            state.samples_taken = 0;
-            state.last_timestamp = None;
-        }
+        // if state.config.max_count > 0 && state.samples_taken >= state.config.max_count {
+        //     *timecode = new_timecode();
+        //     // Manually restart: kill old child and spawn new one
+        //     if let Some(ref mut child) = guard.child {
+        //         child.kill().ok();
+        //         child.wait().ok();
+        //     }
+        //     // Spawn new child
+        //     let mut new_child =
+        //         run_powermetrics(timecode, state.config.interval * 1000)
+        //             .context("failed to restart powermetrics")?;
+        //     // Extract stdout and create new reader
+        //     let child_stdout = new_child.stdout.take().expect("failed to get stdout");
+        //     guard.child = Some(new_child);
+        //     *pm_reader = PowermetricsReader::from_stdout(child_stdout);
+        //     state.samples_taken = 0;
+        //     state.last_timestamp = None;
+        // }
 
         if needs_redraw {
             terminal.draw(|f| {
