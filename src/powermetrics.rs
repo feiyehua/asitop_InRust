@@ -3,13 +3,12 @@ use plist::{self, Date};
 use serde::Deserialize;
 use std::{
     collections::VecDeque,
-    fs::{self, File},
-    io::{Cursor, Read, Seek, SeekFrom},
+    fs::{self},
+    io::{Cursor, Read,},
     process::{Child, Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const POWER_FILE_PREFIX: &str = "/tmp/asitop_powermetrics";
 const MAX_READ_BYTES: u64 = 1 * 1024 * 1024; // 1 MiB from EOF is enough for one sample
 
 #[derive(Debug, Clone)]
@@ -98,9 +97,6 @@ struct RawGpu {
     idle_ratio: f64,
 }
 
-pub fn powermetrics_path(timecode: &str) -> String {
-    format!("{POWER_FILE_PREFIX}{timecode}")
-}
 
 pub fn run_powermetrics(_timecode: &str, interval_ms: u64) -> Result<Child> {
     cleanup_powermetrics_files().ok();
@@ -150,49 +146,17 @@ pub fn new_timecode() -> String {
 /// Cached reader for powermetrics stream to reduce unnecessary I/O
 pub struct PowermetricsReader {
     reader: Box<dyn Read + Send>,
-    path: Option<String>,
-    last_len: u64,
     buffer: Vec<u8>,
 }
 
 impl PowermetricsReader {
-    // /// Create a new reader from a child process's stdout
-    // pub fn from_child(mut child: Child) -> Self {
-    //     let stdout = child.stdout.take().expect("failed to get stdout from powermetrics");
-    //     Self {
-    //         reader: Some(Box::new(stdout) as Box<dyn Read + Send>),
-    //         path: None,
-    //         last_len: 0,
-    //         buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
-    //     }
-    // }
-
     /// Create a new reader from a stdout stream
     pub fn from_stdout(stdout: std::process::ChildStdout) -> Self {
         Self {
             reader: Box::new(stdout) as Box<dyn Read + Send>,
-            path: None,
-            last_len: 0,
             buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
         }
     }
-
-    // /// Create a new reader from a file (legacy mode)
-    // pub fn from_file(timecode: &str) -> Self {
-    //     Self {
-    //         reader: None,
-    //         path: Some(powermetrics_path(timecode)),
-    //         last_len: 0,
-    //         buffer: Vec::with_capacity(MAX_READ_BYTES as usize),
-    //     }
-    // }
-
-    // /// Switch to reading from a new file (for restart)
-    // pub fn set_timecode(&mut self, timecode: &str) {
-    //     self.path = Some(powermetrics_path(timecode));
-    //     self.last_len = 0;
-    //     self.reader = None;
-    // }
 
     pub fn parse(&mut self) -> Result<Option<PowermetricsReading>> {
         // Stream-based reading (pipe mode)

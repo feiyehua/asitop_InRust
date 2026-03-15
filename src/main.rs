@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     cleanup_powermetrics_files().ok();
 
     println!("[2/3] Starting powermetrics process\n");
-    let mut timecode = new_timecode();
+    let timecode = new_timecode();
     let mut child =
         run_powermetrics(&timecode, cli.interval * 1000).context("failed to spawn powermetrics")?;
     // Extract stdout to create reader
@@ -98,8 +98,6 @@ fn main() -> Result<()> {
 
     let result = run_ui(
         &mut state,
-        &mut guard,
-        &mut timecode,
         &mut pm_reader,
         &mut memory_reader,
         &mut io_sampler,
@@ -150,8 +148,6 @@ fn cleanup_terminal() -> Result<()> {
 
 fn run_ui(
     state: &mut AppState,
-    guard: &mut PowermetricsGuard,
-    timecode: &mut String,
     pm_reader: &mut PowermetricsReader,
     memory_reader: &mut MemoryReader,
     io_sampler: &mut IoSampler,
@@ -183,25 +179,6 @@ fn run_ui(
                 }
             }
         }
-
-        // if state.config.max_count > 0 && state.samples_taken >= state.config.max_count {
-        //     *timecode = new_timecode();
-        //     // Manually restart: kill old child and spawn new one
-        //     if let Some(ref mut child) = guard.child {
-        //         child.kill().ok();
-        //         child.wait().ok();
-        //     }
-        //     // Spawn new child
-        //     let mut new_child =
-        //         run_powermetrics(timecode, state.config.interval * 1000)
-        //             .context("failed to restart powermetrics")?;
-        //     // Extract stdout and create new reader
-        //     let child_stdout = new_child.stdout.take().expect("failed to get stdout");
-        //     guard.child = Some(new_child);
-        //     *pm_reader = PowermetricsReader::from_stdout(child_stdout);
-        //     state.samples_taken = 0;
-        //     state.last_timestamp = None;
-        // }
 
         if needs_redraw {
             terminal.draw(|f| {
