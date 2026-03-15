@@ -6,7 +6,7 @@ use std::{
     fs::{self},
     io::{Cursor, Read,},
     process::{Child, Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{SystemTime},
 };
 
 const MAX_READ_BYTES: u64 = 1 * 1024 * 1024; // 1 MiB from EOF is enough for one sample
@@ -98,7 +98,7 @@ struct RawGpu {
 }
 
 
-pub fn run_powermetrics(_timecode: &str, interval_ms: u64) -> Result<Child> {
+pub fn run_powermetrics(interval_ms: u64) -> Result<Child> {
     cleanup_powermetrics_files().ok();
     let interval_arg = interval_ms.to_string();
     let mut cmd = Command::new("sudo");
@@ -133,14 +133,6 @@ pub fn cleanup_powermetrics_files() -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn new_timecode() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.to_string()
 }
 
 /// Cached reader for powermetrics stream to reduce unnecessary I/O

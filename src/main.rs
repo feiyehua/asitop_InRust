@@ -19,7 +19,7 @@ use io_stats::{IoSampler, IoStats};
 use memory::{MemoryReader, MemoryStats};
 use powermetrics::{
     CpuMetrics, GpuMetrics, History, PowermetricsReader, PowermetricsReading, RollingAverage,
-    cleanup_powermetrics_files, new_timecode, run_powermetrics,
+    cleanup_powermetrics_files, run_powermetrics,
 };
 use ratatui::{Terminal, backend::CrosstermBackend, prelude::*};
 use soc::SocInfo;
@@ -78,9 +78,8 @@ fn main() -> Result<()> {
     cleanup_powermetrics_files().ok();
 
     println!("[2/3] Starting powermetrics process\n");
-    let timecode = new_timecode();
     let mut child =
-        run_powermetrics(&timecode, cli.interval * 1000).context("failed to spawn powermetrics")?;
+        run_powermetrics(cli.interval * 1000).context("failed to spawn powermetrics")?;
     // Extract stdout to create reader
     let child_stdout = child.stdout.take().expect("failed to get stdout");
     // Wrap child in RAII guard to ensure cleanup on panic or early return
